@@ -191,10 +191,8 @@
                 }
             }
             logger.log("[ClickableRoles] Hooked: " + (hooked.join(", ") || "nothing"));
-            if (!hooked.length) {
-                discover();
-                ui.toasts.showToast("ClickableRoles: no role components found, check debug logs");
-            }
+            discover();
+            ui.toasts.showToast("ClickableRoles hooked: " + (hooked.join(", ") || "nothing"));
         },
         onUnload() {
             while (unpatches.length) unpatches.pop()();
