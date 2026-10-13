@@ -1,10 +1,10 @@
-/*
- * ClickableRoles for Revenge Classic
- * Port of the Equicord/Vencord ClickableRoles plugin by prism.
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
 (function () {
     "use strict";
+    /*
+     * ClickableRoles for Revenge Classic
+     * Port of the Equicord/Vencord ClickableRoles plugin by prism.
+     * SPDX-License-Identifier: GPL-3.0-or-later
+     */
 
     const { metro, patcher, ui, logger } = vendetta;
     const { findByProps, findByName, findByStoreName } = metro;
