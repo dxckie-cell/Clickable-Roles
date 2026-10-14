@@ -9,9 +9,12 @@
      * SPDX-License-Identifier: GPL-3.0-or-later
      */
 
-    const BUILD = "debug-5";
+    const BUILD = "debug-6";
 
     const { metro, patcher, ui, logger } = vendetta;
+    const storage = vendetta.plugin && vendetta.plugin.storage;
+    let prevLog = [];
+    try { if (storage && storage.log) prevLog = Array.from(storage.log); } catch (e) { }
     const { findByProps, findByName, findByStoreName } = metro;
     const { React, ReactNative: RN } = metro.common;
     const { Forms } = ui.components;
@@ -47,6 +50,7 @@
         logs.push(line);
         if (logs.length > MAX_LOG_LINES) logs.shift();
         try { logger.log("[ClickableRoles] " + msg); } catch (e) { }
+        try { if (storage) storage.log = logs.slice(-150); } catch (e) { }
         listeners.forEach(fn => { try { fn(); } catch (e) { } });
     }
 
@@ -281,6 +285,10 @@
         return newChildren === children ? node : React.cloneElement(node, { children: newChildren });
     }
 
+    function proxyEnabled() {
+        try { return !(storage && storage.proxyOff); } catch (e) { return true; }
+    }
+
     function wrapRoleNode(node, outerGuild) {
         const np = node.props || {};
         const roleId = (np.role && np.role.id) || np.roleId || np.id;
@@ -307,9 +315,12 @@
         const orig = props.__crOrig;
         const rest = Object.assign({}, props);
         delete rest.__crOrig;
+        const n = ++proxyRenders;
+        if (n <= 3) log("proxy #" + n + ": calling original RolesList (" + typeName(orig) + ")");
         let out;
         try {
             out = callComponent(orig, rest);
+            if (n <= 3) log("proxy #" + n + ": original returned " + typeName(out && out.type));
         } catch (e) {
             log("RolesList proxy: couldn't call original (" + errMsg(e) + "), rendering it untouched");
             return h(orig, rest);
@@ -321,7 +332,6 @@
             if (w) wrapped++;
             return w;
         }, 0);
-        const n = ++proxyRenders;
         if (n <= 3) {
             log("RolesList proxy #" + n + " props=" + summarize(rest) + " -> wrapped " + wrapped + " role element(s)");
             if (n <= 2) logTree("RolesList #" + n, out);
@@ -337,7 +347,7 @@
         let proxied = 0;
         const out = mapTree(ret, node => {
             const np = node.props || {};
-            if (np.guildMemberRoleIds && node.type && typeof node.type !== "string" && node.type !== RolesListProxy) {
+            if (np.guildMemberRoleIds && node.type && typeof node.type !== "string" && node.type !== RolesListProxy && proxyEnabled()) {
                 proxied++;
                 return h(RolesListProxy, Object.assign({}, np, { key: node.key, __crOrig: node.type }));
             }
@@ -441,22 +451,12 @@
             return () => { listeners.delete(force); };
         }, []);
 
+        const switchRow = Forms.FormSwitchRow ? h(Forms.FormSwitchRow, {
+            label: "Make profile roles tappable",
+            value: !(storage && storage.proxyOff),
+            onValueChange: v => { if (storage) storage.proxyOff = !v; log("profile roles hook " + (v ? "enabled" : "disabled") + " (applies on next profile open)"); force(); },
+        }) : null;
+
         return h(RN.ScrollView, null,
             h(Forms.FormSection, { title: "ClickableRoles " + BUILD },
-                h(Forms.FormRow, { label: "Copy log", onPress: copyLog }),
-                h(Forms.FormRow, { label: "Clear log", onPress: () => { logs.length = 0; log("log cleared"); } }),
-                h(Forms.FormRow, { label: "Scan components", onPress: discover }),
-                h(Forms.FormRow, { label: "Log render counts", onPress: () => log("render counts: " + JSON.stringify(renderCounts)) }),
-                h(Forms.FormRow, { label: "Open test sheet (current server)", onPress: testSheet })
-            ),
-            h(Forms.FormSection, { title: "Log (" + logs.length + " lines)" },
-                h(Forms.FormText, { selectable: true, style: { padding: 12, fontSize: 11 } }, logs.join("\n") || "(empty)")
-            )
-        );
-    }
-
-    return {
-        onLoad() {
-            try {
-                const G = typeof globalThis !== "undefined" ? globalThis : global;
-                if (G.__clickableRolesCleanup) { try { G.__clickableRolesCleanup(); } ca
+                switchRow,
