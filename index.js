@@ -9,7 +9,7 @@
      * SPDX-License-Identifier: GPL-3.0-or-later
      */
 
-    const BUILD = "debug-4";
+    const BUILD = "debug-5";
 
     const { metro, patcher, ui, logger } = vendetta;
     const { findByProps, findByName, findByStoreName } = metro;
@@ -281,40 +281,52 @@
         return newChildren === children ? node : React.cloneElement(node, { children: newChildren });
     }
 
-    // Finds the module that exports a component we only know from a rendered element, and patches it.
-    function autoPatch(type, label) {
-        if (patchedTypes.has(type)) return;
-        patchedTypes.add(type);
-        const cb = makeAfter(label, "tree");
-        const tryPatch = (holder, key) => {
-            const v = holder[key];
-            let un = null;
-            if (typeof v === "function") un = patcher.after(key, holder, cb);
-            else if (v && typeof v.type === "function") un = patcher.after("type", v, cb);
-            else if (v && typeof v.render === "function") un = patcher.after("render", v, cb);
-            if (un) unpatches.push(un);
-            return !!un;
-        };
-        const mods = metro.modules || {};
-        for (const id in mods) {
-            try {
-                const m = mods[id];
-                if (!m || !m.isInitialized) continue;
-                const ex = m.publicModule && m.publicModule.exports;
-                if (!ex) continue;
-                if (ex.default === type && tryPatch(ex, "default")) {
-                    log("autoPatch: patched " + label + " (module " + id + ", default). Reopen the profile to test.");
-                    return;
-                }
-                for (const k of Object.keys(ex)) {
-                    if (ex[k] === type && tryPatch(ex, k)) {
-                        log("autoPatch: patched " + label + " (module " + id + ", " + k + "). Reopen the profile to test.");
-                        return;
-                    }
-                }
-            } catch (e) { }
+    function wrapRoleNode(node, outerGuild) {
+        const np = node.props || {};
+        const roleId = (np.role && np.role.id) || np.roleId || np.id;
+        const guildId = np.guildId || (np.role && np.role.guildId) || outerGuild;
+        if (!roleId || !guildId || roleId === guildId) return null;
+        if (!GuildRoleStore || !GuildRoleStore.getRole(guildId, roleId)) return null;
+        return h(RN.Pressable, { key: node.key, onPress: () => openRoleMembers(roleId, guildId) }, node);
+    }
+
+    function callComponent(c, props) {
+        if (typeof c === "function") {
+            if (c.prototype && c.prototype.isReactComponent) throw new Error("class component");
+            return c(props);
         }
-        log("autoPatch: couldn't find a module exporting " + label);
+        if (c && typeof c.type === "function") return callComponent(c.type, props);
+        if (c && typeof c.render === "function") return c.render(props, null);
+        throw new Error("unsupported component type");
+    }
+
+    // RolesList isn't exported from any module, so we render it ourselves from inside this proxy
+    // and wrap the role elements it produces.
+    let proxyRenders = 0;
+    function RolesListProxy(props) {
+        const orig = props.__crOrig;
+        const rest = Object.assign({}, props);
+        delete rest.__crOrig;
+        let out;
+        try {
+            out = callComponent(orig, rest);
+        } catch (e) {
+            log("RolesList proxy: couldn't call original (" + errMsg(e) + "), rendering it untouched");
+            return h(orig, rest);
+        }
+        const outerGuild = rest.guildId || (SelectedGuildStore && SelectedGuildStore.getGuildId());
+        let wrapped = 0;
+        const mapped = mapTree(out, node => {
+            const w = wrapRoleNode(node, outerGuild);
+            if (w) wrapped++;
+            return w;
+        }, 0);
+        const n = ++proxyRenders;
+        if (n <= 3) {
+            log("RolesList proxy #" + n + " props=" + summarize(rest) + " -> wrapped " + wrapped + " role element(s)");
+            if (n <= 2) logTree("RolesList #" + n, out);
+        }
+        return mapped;
     }
 
     function handleTree(name, args, ret) {
@@ -322,21 +334,22 @@
         const p = (args && args[0]) || {};
         const outerGuild = p.guildId || (SelectedGuildStore && SelectedGuildStore.getGuildId());
         let wrapped = 0;
+        let proxied = 0;
         const out = mapTree(ret, node => {
             const np = node.props || {};
-            if (np.guildMemberRoleIds && node.type && typeof node.type !== "string") autoPatch(node.type, "RolesList");
-            const roleId = (np.role && np.role.id) || np.roleId;
-            const guildId = np.guildId || (np.role && np.role.guildId) || outerGuild;
-            if (!roleId || !guildId || roleId === guildId) return null;
-            if (!GuildRoleStore || !GuildRoleStore.getRole(guildId, roleId)) return null;
-            wrapped++;
-            return h(RN.Pressable, { key: node.key, onPress: () => openRoleMembers(roleId, guildId) }, node);
+            if (np.guildMemberRoleIds && node.type && typeof node.type !== "string" && node.type !== RolesListProxy) {
+                proxied++;
+                return h(RolesListProxy, Object.assign({}, np, { key: node.key, __crOrig: node.type }));
+            }
+            const w = wrapRoleNode(node, outerGuild);
+            if (w) wrapped++;
+            return w;
         }, 0);
         if (n <= 3) {
-            log(name + " #" + n + " props=" + summarize(p) + " -> wrapped " + wrapped + " role element(s)");
+            log(name + " #" + n + " props=" + summarize(p) + " -> wrapped " + wrapped + ", proxied " + proxied);
             if (n <= 2) logTree(name + " #" + n, ret);
         }
-        return wrapped ? out : undefined;
+        return wrapped || proxied ? out : undefined;
     }
 
     function handleObserve(name, args, ret) {
@@ -446,49 +459,4 @@
         onLoad() {
             try {
                 const G = typeof globalThis !== "undefined" ? globalThis : global;
-                if (G.__clickableRolesCleanup) { try { G.__clickableRolesCleanup(); } catch (e) { } }
-                G.__clickableRolesCleanup = () => { while (unpatches.length) unpatches.pop()(); };
-                this.__load();
-            } catch (e) {
-                log("onLoad error: " + errMsg(e));
-                try { ui.toasts.showToast("ClickableRoles onLoad error: " + errMsg(e)); } catch (x) { }
-            }
-        },
-        __load() {
-            log("build " + BUILD + " loading");
-            log("modules: GuildRoleStore=" + !!GuildRoleStore + " UserStore=" + !!UserStore +
-                " SelectedGuildStore=" + !!SelectedGuildStore + " RestAPI=" + !!RestAPI +
-                " UserUtils=" + !!UserUtils + " LazySheet=" + !!LazySheet + " ActionSheet=" + !!(SheetUI && SheetUI.ActionSheet) +
-                " showUserProfile=" + !!findByProps("showUserProfile"));
-
-            const hooked = [];
-            for (const t of TARGETS) {
-                const name = t.name;
-                try {
-                    const mod = findByName(name, false);
-                    if (!mod) { log("not found: " + name); continue; }
-                    const unpatch = patchModule(mod, name, t.mode);
-                    if (unpatch) { unpatches.push(unpatch); hooked.push(name + "(" + t.mode + ")"); if (mod.default) patchedTypes.add(mod.default); }
-                    else log("found " + name + " but couldn't patch it (default export is " + typeof mod.default + ")");
-                } catch (e) {
-                    log("failed to patch " + name + ": " + errMsg(e));
-                }
-            }
-            log("hooked: " + (hooked.join(", ") || "nothing"));
-            ui.toasts.showToast("ClickableRoles " + BUILD + " hooked: " + (hooked.join(", ") || "nothing"));
-        },
-        onUnload() {
-            while (unpatches.length) unpatches.pop()();
-        },
-        settings: DebugSettings,
-    };
-    }
-
-    try {
-        return build();
-    } catch (e) {
-        try { vendetta.logger.log("[ClickableRoles] init error: " + (e && e.message)); } catch (x) { }
-        try { vendetta.ui.toasts.showToast("ClickableRoles init error: " + (e && e.message)); } catch (x) { }
-        return { onLoad() { }, onUnload() { } };
-    }
-})();
+                if (G.__clickableRolesCleanup) { try { G.__clickableRolesCleanup(); } ca
