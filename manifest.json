@@ -1,0 +1,8 @@
+{
+  "name": "ClickableRoles",
+  "description": "Click on roles in user profiles and the member list to see which members have them.",
+  "authors": [{ "name": "dxckie-cell" }],
+  "main": "index.js",
+  "hash": "593e560842968ce08a15765bff4f94d3f414d2d2ca7d3671f6b7a473e1b856ff",
+  "vendetta": { "icon": "ic_members" }
+}
