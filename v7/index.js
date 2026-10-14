@@ -9,7 +9,7 @@
      * SPDX-License-Identifier: GPL-3.0-or-later
      */
 
-    const BUILD = "debug-7";
+    const BUILD = "debug-8";
 
     const { metro, patcher, ui, logger } = vendetta;
     const storage = vendetta.plugin && vendetta.plugin.storage;
@@ -32,7 +32,8 @@
         { name: "RolePill", mode: "pill" },
         { name: "UserProfileRolesCard", mode: "tree" },
         { name: "MemberRolesList", mode: "tree" },
-        { name: "StandaloneMembersView", mode: "observe" },
+        { name: "StandaloneMembersView", mode: "members" },
+        { name: "GuildChannelMemberRow", mode: "observe" },
         { name: "RoleMembersActionSheet", mode: "observe" },
     ];
 
@@ -286,7 +287,7 @@
     }
 
     function proxyEnabled() {
-        try { return !!(storage && storage.proxyOn); } catch (e) { return false; }
+        try { return !(storage && storage.proxyOff); } catch (e) { return true; }
     }
 
     function wrapRoleNode(node, outerGuild) {
@@ -370,11 +371,63 @@
         }
     }
 
+    function roleIdFromSection(section, guildId) {
+        if (!section) return null;
+        const cands = [section.roleId, section.id, section.role && section.role.id, section.key, section.groupId];
+        for (const c of cands) {
+            if (c && c !== guildId && GuildRoleStore && GuildRoleStore.getRole(guildId, String(c))) return String(c);
+        }
+        return null;
+    }
+
+    // Member list: wrap the section header renderer so role headers become tappable.
+    function handleMembers(name, args, ret) {
+        const n = (renderCounts[name] = (renderCounts[name] || 0) + 1);
+        const p = (args && args[0]) || {};
+        const outerGuild = p.guildId || (SelectedGuildStore && SelectedGuildStore.getGuildId());
+        let patched = 0;
+        const out = mapTree(ret, node => {
+            const np = node.props || {};
+            const list = np.sections || np.data;
+            if (n <= 2 && Array.isArray(list)) {
+                log(name + " #" + n + " " + typeName(node.type) + " " + (np.sections ? "sections" : "data") + "[" + list.length + "]: " +
+                    list.slice(0, 3).map(x => summarize(x, 0)).join(" | "));
+            }
+            if (typeof np.renderSectionHeader === "function" && !np.renderSectionHeader.__cr) {
+                const orig = np.renderSectionHeader;
+                let calls = 0;
+                const wrappedFn = function (info) {
+                    const r = orig.apply(this, arguments);
+                    try {
+                        const section = info && info.section;
+                        const guildId = (section && section.guildId) || outerGuild;
+                        const roleId = roleIdFromSection(section, guildId);
+                        if (++calls <= 4) log("sectionHeader #" + calls + " section=" + summarize(section, 0) + " -> role " + roleId);
+                        if (roleId && r) return h(RN.Pressable, { onPress: () => openRoleMembers(roleId, guildId) }, r);
+                    } catch (e) {
+                        log("sectionHeader error: " + errMsg(e));
+                    }
+                    return r;
+                };
+                wrappedFn.__cr = true;
+                patched++;
+                return React.cloneElement(node, { renderSectionHeader: wrappedFn });
+            }
+            return null;
+        }, 0);
+        if (n <= 2) {
+            log(name + " #" + n + " props=" + summarize(p) + " ret=" + typeName(ret && ret.type) + " -> patched " + patched + " section list(s)");
+            logTree(name + " #" + n, ret);
+        }
+        return patched ? out : undefined;
+    }
+
     function makeAfter(name, mode) {
         return function (args, ret) {
             try {
                 if (mode === "tree") return handleTree(name, args, ret);
                 if (mode === "observe") return handleObserve(name, args, ret);
+                if (mode === "members") return proxyEnabled() ? handleMembers(name, args, ret) : undefined;
                 return handleRender(name, args, ret);
             } catch (e) {
                 log("ERROR in " + name + " hook: " + errMsg(e));
@@ -398,133 +451,4 @@
         let scanned = 0;
         for (const id in mods) {
             try {
-                const m = mods[id];
-                if (!m || !m.isInitialized) continue;
-                const ex = m.publicModule && m.publicModule.exports;
-                if (!ex) continue;
-                scanned++;
-                for (const c of [ex, ex.default]) {
-                    const n = c && (c.displayName || c.name || (c.type && (c.type.displayName || c.type.name)));
-                    if (typeof n === "string" && /role|member|sectionheader|profile|pill|tag/i.test(n)) found.add(n);
-                }
-            } catch (e) { }
-        }
-        const names = Array.from(found).sort();
-        log("scan: " + scanned + " modules, " + names.length + " matching names");
-        let chunk = "";
-        for (const n of names) {
-            if (chunk.length + n.length > 500) { log("scan: " + chunk); chunk = ""; }
-            chunk += (chunk ? ", " : "") + n;
-        }
-        if (chunk) log("scan: " + chunk);
-    }
-
-    function testSheet() {
-        try {
-            const guildId = SelectedGuildStore && SelectedGuildStore.getGuildId();
-            if (!guildId) { log("test: no server selected (open a server first)"); return; }
-            let roles = GuildRoleStore.getSortedRoles ? GuildRoleStore.getSortedRoles(guildId) : null;
-            if (!roles && GuildRoleStore.getRoles) roles = Object.values(GuildRoleStore.getRoles(guildId) || {});
-            const role = (roles || []).find(r => r && r.id !== guildId);
-            if (!role) { log("test: no roles found for guild " + guildId); return; }
-            log("test: using role " + role.name + " (" + role.id + ")");
-            openRoleMembers(role.id, guildId);
-        } catch (e) {
-            log("test failed: " + errMsg(e));
-        }
-    }
-
-    function copyLog() {
-        try {
-            const Clip = (metro.common && metro.common.clipboard) || findByProps("setString");
-            Clip.setString(logs.join("\n"));
-            ui.toasts.showToast("Log copied");
-        } catch (e) {
-            log("copy failed: " + errMsg(e));
-        }
-    }
-
-    function DebugSettings() {
-        const [, force] = React.useReducer(x => x + 1, 0);
-        React.useEffect(() => {
-            listeners.add(force);
-            return () => { listeners.delete(force); };
-        }, []);
-
-        const switchRow = Forms.FormSwitchRow ? h(Forms.FormSwitchRow, {
-            label: "Make profile roles tappable",
-            value: !!(storage && storage.proxyOn),
-            onValueChange: v => { if (storage) storage.proxyOn = !!v; log("profile roles hook " + (v ? "enabled" : "disabled") + " (applies on next profile open)"); force(); },
-        }) : null;
-
-        return h(RN.ScrollView, null,
-            h(Forms.FormSection, { title: "ClickableRoles " + BUILD },
-                switchRow,
-                h(Forms.FormRow, { label: "Copy log", onPress: copyLog }),
-                h(Forms.FormRow, { label: "Clear log", onPress: () => { logs.length = 0; log("log cleared"); } }),
-                h(Forms.FormRow, { label: "Scan components", onPress: discover }),
-                h(Forms.FormRow, { label: "Log render counts", onPress: () => log("render counts: " + JSON.stringify(renderCounts)) }),
-                h(Forms.FormRow, { label: "Open test sheet (current server)", onPress: testSheet })
-            ),
-            h(Forms.FormSection, { title: "Log (" + logs.length + " lines)" },
-                h(Forms.FormText, { selectable: true, style: { padding: 12, fontSize: 11 } }, logs.join("\n") || "(empty)")
-            ),
-            prevLog.length ? h(Forms.FormSection, { title: "Previous session log (" + prevLog.length + " lines)" },
-                h(Forms.FormRow, { label: "Copy previous session log", onPress: () => {
-                    try { (metro.common.clipboard || findByProps("setString")).setString(prevLog.join("\n")); ui.toasts.showToast("Previous log copied"); } catch (e) { log("copy failed: " + errMsg(e)); }
-                } }),
-                h(Forms.FormText, { selectable: true, style: { padding: 12, fontSize: 11 } }, prevLog.join("\n"))
-            ) : null
-        );
-    }
-
-    return {
-        onLoad() {
-            try {
-                const G = typeof globalThis !== "undefined" ? globalThis : global;
-                if (G.__clickableRolesCleanup) { try { G.__clickableRolesCleanup(); } catch (e) { } }
-                G.__clickableRolesCleanup = () => { while (unpatches.length) unpatches.pop()(); };
-                this.__load();
-            } catch (e) {
-                log("onLoad error: " + errMsg(e));
-                try { ui.toasts.showToast("ClickableRoles onLoad error: " + errMsg(e)); } catch (x) { }
-            }
-        },
-        __load() {
-            log("build " + BUILD + " loading");
-            log("modules: GuildRoleStore=" + !!GuildRoleStore + " UserStore=" + !!UserStore +
-                " SelectedGuildStore=" + !!SelectedGuildStore + " RestAPI=" + !!RestAPI +
-                " UserUtils=" + !!UserUtils + " LazySheet=" + !!LazySheet + " ActionSheet=" + !!(SheetUI && SheetUI.ActionSheet) +
-                " showUserProfile=" + !!findByProps("showUserProfile"));
-
-            const hooked = [];
-            for (const t of TARGETS) {
-                const name = t.name;
-                try {
-                    const mod = findByName(name, false);
-                    if (!mod) { log("not found: " + name); continue; }
-                    const unpatch = patchModule(mod, name, t.mode);
-                    if (unpatch) { unpatches.push(unpatch); hooked.push(name + "(" + t.mode + ")"); if (mod.default) patchedTypes.add(mod.default); }
-                    else log("found " + name + " but couldn't patch it (default export is " + typeof mod.default + ")");
-                } catch (e) {
-                    log("failed to patch " + name + ": " + errMsg(e));
-                }
-            }
-            log("hooked: " + (hooked.join(", ") || "nothing"));
-            ui.toasts.showToast("ClickableRoles " + BUILD + " hooked: " + (hooked.join(", ") || "nothing"));
-        },
-        onUnload() {
-            while (unpatches.length) unpatches.pop()();
-        },
-        settings: DebugSettings,
-    };
-    }
-
-    try {
-        return build();
-    } catch (e) {
-        try { vendetta.logger.log("[ClickableRoles] init error: " + (e && e.message)); } catch (x) { }
-        try { vendetta.ui.toasts.showToast("ClickableRoles init error: " + (e && e.message)); } catch (x) { }
-        return { onLoad() { }, onUnload() { } };
-    }
-})();
+  
