@@ -6,7 +6,7 @@
      * SPDX-License-Identifier: GPL-3.0-or-later
      */
 
-    const BUILD = "debug-2";
+    const BUILD = "debug-3";
 
     const { metro, patcher, ui, logger } = vendetta;
     const { findByProps, findByName, findByStoreName } = metro;
@@ -26,11 +26,13 @@
         { name: "RolePill", mode: "pill" },
         { name: "UserProfileRolesCard", mode: "tree" },
         { name: "MemberRolesList", mode: "tree" },
+        { name: "RolesList", mode: "tree" },
         { name: "StandaloneMembersView", mode: "observe" },
         { name: "RoleMembersActionSheet", mode: "observe" },
     ];
 
     const unpatches = [];
+    const patchedTypes = new Set();
     const memberCache = new Map();
     const renderCounts = {};
 
@@ -277,6 +279,42 @@
         return newChildren === children ? node : React.cloneElement(node, { children: newChildren });
     }
 
+    // Finds the module that exports a component we only know from a rendered element, and patches it.
+    function autoPatch(type, label) {
+        if (patchedTypes.has(type)) return;
+        patchedTypes.add(type);
+        const cb = makeAfter(label, "tree");
+        const tryPatch = (holder, key) => {
+            const v = holder[key];
+            let un = null;
+            if (typeof v === "function") un = patcher.after(key, holder, cb);
+            else if (v && typeof v.type === "function") un = patcher.after("type", v, cb);
+            else if (v && typeof v.render === "function") un = patcher.after("render", v, cb);
+            if (un) unpatches.push(un);
+            return !!un;
+        };
+        const mods = metro.modules || {};
+        for (const id in mods) {
+            try {
+                const m = mods[id];
+                if (!m || !m.isInitialized) continue;
+                const ex = m.publicModule && m.publicModule.exports;
+                if (!ex) continue;
+                if (ex.default === type && tryPatch(ex, "default")) {
+                    log("autoPatch: patched " + label + " (module " + id + ", default). Reopen the profile to test.");
+                    return;
+                }
+                for (const k of Object.keys(ex)) {
+                    if (ex[k] === type && tryPatch(ex, k)) {
+                        log("autoPatch: patched " + label + " (module " + id + ", " + k + "). Reopen the profile to test.");
+                        return;
+                    }
+                }
+            } catch (e) { }
+        }
+        log("autoPatch: couldn't find a module exporting " + label);
+    }
+
     function handleTree(name, args, ret) {
         const n = (renderCounts[name] = (renderCounts[name] || 0) + 1);
         const p = (args && args[0]) || {};
@@ -284,6 +322,7 @@
         let wrapped = 0;
         const out = mapTree(ret, node => {
             const np = node.props || {};
+            if (np.guildMemberRoleIds && node.type && typeof node.type !== "string") autoPatch(node.type, "RolesList");
             const roleId = (np.role && np.role.id) || np.roleId;
             const guildId = np.guildId || (np.role && np.role.guildId) || outerGuild;
             if (!roleId || !guildId || roleId === guildId) return null;
@@ -411,23 +450,4 @@
 
             const hooked = [];
             for (const t of TARGETS) {
-                const name = t.name;
-                try {
-                    const mod = findByName(name, false);
-                    if (!mod) { log("not found: " + name); continue; }
-                    const unpatch = patchModule(mod, name, t.mode);
-                    if (unpatch) { unpatches.push(unpatch); hooked.push(name + "(" + t.mode + ")"); }
-                    else log("found " + name + " but couldn't patch it (default export is " + typeof mod.default + ")");
-                } catch (e) {
-                    log("failed to patch " + name + ": " + errMsg(e));
-                }
-            }
-            log("hooked: " + (hooked.join(", ") || "nothing"));
-            ui.toasts.showToast("ClickableRoles " + BUILD + " hooked: " + (hooked.join(", ") || "nothing"));
-        },
-        onUnload() {
-            while (unpatches.length) unpatches.pop()();
-        },
-        settings: DebugSettings,
-    };
-})();
+             
