@@ -3,6 +3,6 @@
   "description": "Click on roles in user profiles and the member list to see which members have them.",
   "authors": [{ "name": "dxckie-cell" }],
   "main": "index.js",
-  "hash": "9cbb4d058f0a28952415e141363223f8f114704696b2fcfabc1838ec03832dab",
+  "hash": "2e18a6243b455a4c6d70461101997fe1b53f98c41a968b96102a5f69a0c37a36",
   "vendetta": { "icon": "ic_members" }
 }
