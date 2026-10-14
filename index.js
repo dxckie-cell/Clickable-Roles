@@ -6,7 +6,7 @@
      * SPDX-License-Identifier: GPL-3.0-or-later
      */
 
-    const BUILD = "debug-1";
+    const BUILD = "debug-2";
 
     const { metro, patcher, ui, logger } = vendetta;
     const { findByProps, findByName, findByStoreName } = metro;
@@ -19,12 +19,15 @@
     const MAX_LOG_LINES = 500;
     const VERBOSE_RENDERS = 8;
 
-    // Component names to try hooking. A hook only wraps something when its props
-    // point at a real role in the current guild, so a wrong guess is harmless.
-    const CANDIDATES = [
-        "RolePill", "UserProfileRoles", "UserProfileRole", "ProfileRole", "RoleTag", "RoleChip",
-        "MemberListSectionHeader", "ChannelMemberListSectionHeader", "GuildMemberListSectionHeader",
-        "MemberSectionHeader", "MemberListHeader",
+    // Components to hook. mode "pill": wrap the component's own output.
+    // mode "tree": walk the rendered element tree and wrap any child that carries a role.
+    // mode "observe": only log props and the rendered tree, to learn how it works.
+    const TARGETS = [
+        { name: "RolePill", mode: "pill" },
+        { name: "UserProfileRolesCard", mode: "tree" },
+        { name: "MemberRolesList", mode: "tree" },
+        { name: "StandaloneMembersView", mode: "observe" },
+        { name: "RoleMembersActionSheet", mode: "observe" },
     ];
 
     const unpatches = [];
@@ -36,7 +39,7 @@
     const listeners = new Set();
 
     function log(msg) {
-        const line = new Date().toISOString().slice(11, 19) + " " + msg;
+        const line = new Date().toISOString().slice(11, 19) + " " + String(msg).slice(0, 400);
         logs.push(line);
         if (logs.length > MAX_LOG_LINES) logs.shift();
         try { logger.log("[ClickableRoles] " + msg); } catch (e) { }
@@ -235,9 +238,79 @@
         return h(RN.Pressable, { onPress: open }, ret);
     }
 
-    function makeAfter(name) {
+    function dumpTree(node, depth, out, budget) {
+        if (budget.n <= 0 || depth > 9) return;
+        if (Array.isArray(node)) { node.forEach(c => dumpTree(c, depth, out, budget)); return; }
+        if (!React.isValidElement(node)) return;
+        budget.n--;
+        const p = node.props || {};
+        const keys = Object.keys(p).filter(k => k !== "children").slice(0, 8).map(k => k + "=" + summarize(p[k], 0));
+        out.push("  ".repeat(depth) + typeName(node.type) + " " + keys.join(" "));
+        dumpTree(p.children, depth + 1, out, budget);
+    }
+
+    function logTree(label, ret) {
+        const out = [];
+        dumpTree(ret, 0, out, { n: 45 });
+        log(label + " tree (" + out.length + " nodes):");
+        out.forEach(l => log("| " + l));
+    }
+
+    // Returns the same reference when nothing below changed.
+    function mapTree(node, fn, depth) {
+        if (depth > 14) return node;
+        if (Array.isArray(node)) {
+            let changed = false;
+            const mapped = node.map(c => {
+                const r = mapTree(c, fn, depth + 1);
+                if (r !== c) changed = true;
+                return r;
+            });
+            return changed ? mapped : node;
+        }
+        if (!React.isValidElement(node)) return node;
+        const replaced = fn(node);
+        if (replaced) return replaced;
+        const children = node.props && node.props.children;
+        if (children == null) return node;
+        const newChildren = mapTree(children, fn, depth + 1);
+        return newChildren === children ? node : React.cloneElement(node, { children: newChildren });
+    }
+
+    function handleTree(name, args, ret) {
+        const n = (renderCounts[name] = (renderCounts[name] || 0) + 1);
+        const p = (args && args[0]) || {};
+        const outerGuild = p.guildId || (SelectedGuildStore && SelectedGuildStore.getGuildId());
+        let wrapped = 0;
+        const out = mapTree(ret, node => {
+            const np = node.props || {};
+            const roleId = (np.role && np.role.id) || np.roleId;
+            const guildId = np.guildId || (np.role && np.role.guildId) || outerGuild;
+            if (!roleId || !guildId || roleId === guildId) return null;
+            if (!GuildRoleStore || !GuildRoleStore.getRole(guildId, roleId)) return null;
+            wrapped++;
+            return h(RN.Pressable, { key: node.key, onPress: () => openRoleMembers(roleId, guildId) }, node);
+        }, 0);
+        if (n <= 3) {
+            log(name + " #" + n + " props=" + summarize(p) + " -> wrapped " + wrapped + " role element(s)");
+            if (n <= 2) logTree(name + " #" + n, ret);
+        }
+        return wrapped ? out : undefined;
+    }
+
+    function handleObserve(name, args, ret) {
+        const n = (renderCounts[name] = (renderCounts[name] || 0) + 1);
+        if (n <= 2) {
+            log(name + " #" + n + " props=" + summarize((args && args[0]) || {}) + " ret=" + typeName(ret && ret.type));
+            logTree(name + " #" + n, ret);
+        }
+    }
+
+    function makeAfter(name, mode) {
         return function (args, ret) {
             try {
+                if (mode === "tree") return handleTree(name, args, ret);
+                if (mode === "observe") return handleObserve(name, args, ret);
                 return handleRender(name, args, ret);
             } catch (e) {
                 log("ERROR in " + name + " hook: " + errMsg(e));
@@ -245,8 +318,8 @@
         };
     }
 
-    function patchModule(mod, name) {
-        const cb = makeAfter(name);
+    function patchModule(mod, name, mode) {
+        const cb = makeAfter(name, mode);
         const def = mod && mod.default;
         if (typeof def === "function") return patcher.after("default", mod, cb);
         if (def && typeof def.type === "function") return patcher.after("type", def, cb);
@@ -337,12 +410,13 @@
                 " showUserProfile=" + !!findByProps("showUserProfile"));
 
             const hooked = [];
-            for (const name of CANDIDATES) {
+            for (const t of TARGETS) {
+                const name = t.name;
                 try {
                     const mod = findByName(name, false);
-                    if (!mod) continue;
-                    const unpatch = patchModule(mod, name);
-                    if (unpatch) { unpatches.push(unpatch); hooked.push(name); }
+                    if (!mod) { log("not found: " + name); continue; }
+                    const unpatch = patchModule(mod, name, t.mode);
+                    if (unpatch) { unpatches.push(unpatch); hooked.push(name + "(" + t.mode + ")"); }
                     else log("found " + name + " but couldn't patch it (default export is " + typeof mod.default + ")");
                 } catch (e) {
                     log("failed to patch " + name + ": " + errMsg(e));
